@@ -15,6 +15,8 @@ class AppConfig:
     conf: float = 0.25
     iou: float = 0.45
     tracker_key: str = "botsort"
+    rider_moto_ioa: float = 0.05
+    gear_rider_ioa: float = 0.20
 
 
 CLASS_COLORS_BGR: Dict[int, Tuple[int, int, int]] = {
@@ -35,13 +37,6 @@ CLASS_NAMES_DEFAULT: Dict[int, str] = {
 
 
 TARGET_CLASS_IDS: Tuple[int, ...] = (0, 1, 2, 3, 4)
-
-# Post-processing overlap thresholds to reduce false positives.
-# We use intersection-over-area (IoA) instead of IoU because Helmet/Footwear boxes
-# are much smaller than Rider boxes and IoU can be tiny even when correct.
-RIDER_REQUIRES_MOTORCYCLE_IOA: float = 0.05
-GEAR_REQUIRES_RIDER_IOA: float = 0.20
-
 
 def _box_area(box: Tuple[int, int, int, int]) -> int:
     x1, y1, x2, y2 = box
@@ -118,6 +113,12 @@ class VideoThread(QtCore.QThread):
     def set_tracker(self, tracker_key: str) -> None:
         self._config.tracker_key = tracker_key
         self._restart_requested = True
+
+    def set_rider_moto_ioa(self, value: float) -> None:
+        self._config.rider_moto_ioa = max(0.0, min(1.0, float(value)))
+
+    def set_gear_rider_ioa(self, value: float) -> None:
+        self._config.gear_rider_ioa = max(0.0, min(1.0, float(value)))
 
     def play(self) -> None:
         self._paused = False
@@ -246,7 +247,7 @@ class VideoThread(QtCore.QThread):
         if moto_boxes:
             for d in riders:
                 rbox = (d[0], d[1], d[2], d[3])
-                ok = any(_ioa(rbox, mbox) >= RIDER_REQUIRES_MOTORCYCLE_IOA for mbox in moto_boxes)
+                ok = any(_ioa(rbox, mbox) >= self._config.rider_moto_ioa for mbox in moto_boxes)
                 if ok:
                     kept_riders.append(d)
                     rider_boxes.append(rbox)
@@ -260,7 +261,7 @@ class VideoThread(QtCore.QThread):
         if rider_boxes:
             for d in gear:
                 gbox = (d[0], d[1], d[2], d[3])
-                ok = any(_ioa(gbox, rbox) >= GEAR_REQUIRES_RIDER_IOA for rbox in rider_boxes)
+                ok = any(_ioa(gbox, rbox) >= self._config.gear_rider_ioa for rbox in rider_boxes)
                 if ok:
                     kept_gear.append(d)
 
@@ -439,8 +440,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.iouSlider.setRange(0, 100)
         self.iouSlider.setValue(45)
 
+        self.riderMotoSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.riderMotoSlider.setRange(0, 100)
+        self.riderMotoSlider.setValue(5)
+
+        self.gearRiderSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.gearRiderSlider.setRange(0, 100)
+        self.gearRiderSlider.setValue(20)
+
         self.confValue = QtWidgets.QLabel("0.25")
         self.iouValue = QtWidgets.QLabel("0.45")
+        self.riderMotoValue = QtWidgets.QLabel("0.05")
+        self.gearRiderValue = QtWidgets.QLabel("0.20")
 
         grid = QtWidgets.QGridLayout()
         grid.addWidget(self.btnLoadVideo, 0, 0, 1, 2)
@@ -468,6 +479,14 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(self.iouSlider, 5, 1, 1, 2)
         grid.addWidget(self.iouValue, 5, 3)
 
+        grid.addWidget(QtWidgets.QLabel("Rider requires Motorcycle (IoA)"), 6, 0)
+        grid.addWidget(self.riderMotoSlider, 6, 1, 1, 2)
+        grid.addWidget(self.riderMotoValue, 6, 3)
+
+        grid.addWidget(QtWidgets.QLabel("Gear requires Rider (IoA)"), 7, 0)
+        grid.addWidget(self.gearRiderSlider, 7, 1, 1, 2)
+        grid.addWidget(self.gearRiderValue, 7, 3)
+
         btnRow = QtWidgets.QHBoxLayout()
         btnRow.addWidget(self.btnPlay)
         btnRow.addWidget(self.btnPause)
@@ -494,6 +513,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.confSlider.valueChanged.connect(self._on_conf_changed)
         self.iouSlider.valueChanged.connect(self._on_iou_changed)
+        self.riderMotoSlider.valueChanged.connect(self._on_rider_moto_changed)
+        self.gearRiderSlider.valueChanged.connect(self._on_gear_rider_changed)
         self.trackerCombo.currentIndexChanged.connect(self._on_tracker_changed)
 
     def _set_status(self, text: str) -> None:
@@ -600,6 +621,16 @@ class MainWindow(QtWidgets.QMainWindow):
         iou = value / 100.0
         self.iouValue.setText(f"{iou:.2f}")
         self._thread.set_iou(iou)
+
+    def _on_rider_moto_changed(self, value: int) -> None:
+        thr = value / 100.0
+        self.riderMotoValue.setText(f"{thr:.2f}")
+        self._thread.set_rider_moto_ioa(thr)
+
+    def _on_gear_rider_changed(self, value: int) -> None:
+        thr = value / 100.0
+        self.gearRiderValue.setText(f"{thr:.2f}")
+        self._thread.set_gear_rider_ioa(thr)
 
     def _on_tracker_changed(self) -> None:
         tracker_key = self.trackerCombo.currentData()
