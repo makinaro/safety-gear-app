@@ -61,6 +61,108 @@ def _ioa(child: Tuple[int, int, int, int], parent: Tuple[int, int, int, int]) ->
     return inter / float(area_child)
 
 
+class DropLabel(QtWidgets.QLabel):
+    """QLabel that accepts drag-and-drop file paths."""
+
+    fileDropped = QtCore.pyqtSignal(str)
+
+    def __init__(self, text: str = "", allowed_exts: Tuple[str, ...] = (), parent=None) -> None:
+        super().__init__(text, parent)
+        self._allowed_exts = tuple(e.lower() for e in allowed_exts)
+        self.setAcceptDrops(True)
+
+    def _is_allowed(self, path: str) -> bool:
+        if not self._allowed_exts:
+            return True
+        ext = os.path.splitext(path)[1].lower()
+        return ext in self._allowed_exts
+
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
+        md = event.mimeData()
+        if not md.hasUrls():
+            event.ignore()
+            return
+
+        paths = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
+        if len(paths) != 1:
+            event.ignore()
+            return
+        if not self._is_allowed(paths[0]):
+            event.ignore()
+            return
+
+        event.acceptProposedAction()
+
+    def dropEvent(self, event: QtGui.QDropEvent) -> None:
+        md = event.mimeData()
+        if not md.hasUrls():
+            event.ignore()
+            return
+        paths = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
+        if len(paths) != 1:
+            event.ignore()
+            return
+        path = paths[0]
+        if not self._is_allowed(path):
+            event.ignore()
+            return
+        self.fileDropped.emit(path)
+        event.acceptProposedAction()
+
+
+class MultiDropLabel(QtWidgets.QLabel):
+    """QLabel that accepts drag-and-drop of one or more file paths."""
+
+    pathsDropped = QtCore.pyqtSignal(list)
+
+    def __init__(self, text: str = "", allowed_exts: Tuple[str, ...] = (), parent=None) -> None:
+        super().__init__(text, parent)
+        self._allowed_exts = tuple(e.lower() for e in allowed_exts)
+        self.setAcceptDrops(True)
+
+    def _is_allowed(self, path: str) -> bool:
+        if not self._allowed_exts:
+            return True
+        ext = os.path.splitext(path)[1].lower()
+        return ext in self._allowed_exts
+
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
+        md = event.mimeData()
+        if not md.hasUrls():
+            event.ignore()
+            return
+
+        paths = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
+        if not paths:
+            event.ignore()
+            return
+
+        allowed = [p for p in paths if self._is_allowed(p)]
+        if not allowed:
+            event.ignore()
+            return
+
+        event.acceptProposedAction()
+
+    def dropEvent(self, event: QtGui.QDropEvent) -> None:
+        md = event.mimeData()
+        if not md.hasUrls():
+            event.ignore()
+            return
+        paths = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
+        if not paths:
+            event.ignore()
+            return
+
+        allowed = [p for p in paths if self._is_allowed(p)]
+        if not allowed:
+            event.ignore()
+            return
+
+        self.pathsDropped.emit(allowed)
+        event.acceptProposedAction()
+
+
 def clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
 
@@ -391,6 +493,10 @@ class MainWindow(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("Safety Gear Compliance Tester (YOLO + Tracking)")
 
+        # Enable drag-and-drop anywhere in the window (Windows can be finicky if you
+        # don't drop exactly on the label).
+        self.setAcceptDrops(True)
+
         self._video_path: Optional[str] = None
         self._model_paths: Dict[int, Optional[str]] = {cid: None for cid in TARGET_CLASS_IDS}
 
@@ -400,11 +506,47 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._build_ui()
 
+    def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
+        md = event.mimeData()
+        if not md.hasUrls():
+            event.ignore()
+            return
+
+        paths = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
+        if not paths:
+            event.ignore()
+            return
+
+        allowed_exts = {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".pt"}
+        if not any(os.path.splitext(p)[1].lower() in allowed_exts for p in paths):
+            event.ignore()
+            return
+
+        event.acceptProposedAction()
+
+    def dropEvent(self, event: QtGui.QDropEvent) -> None:
+        md = event.mimeData()
+        if not md.hasUrls():
+            event.ignore()
+            return
+
+        paths = [u.toLocalFile() for u in md.urls() if u.isLocalFile()]
+        if not paths:
+            event.ignore()
+            return
+
+        self._handle_dropped_paths(paths)
+        event.acceptProposedAction()
+
     def _build_ui(self) -> None:
         central = QtWidgets.QWidget(self)
         self.setCentralWidget(central)
 
-        self.videoLabel = QtWidgets.QLabel("Load a video and model", self)
+        self.videoLabel = MultiDropLabel(
+            "Drop a video and/or .pt model files here",
+            allowed_exts=(".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv", ".pt"),
+            parent=self,
+        )
         self.videoLabel.setAlignment(QtCore.Qt.AlignCenter)
         self.videoLabel.setMinimumSize(960, 540)
         self.videoLabel.setStyleSheet("background-color: #111; color: #ddd;")
@@ -417,11 +559,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btnLoadFootwear = QtWidgets.QPushButton("Load Footwear Model")
         self.btnLoadImproperFootwear = QtWidgets.QPushButton("Load Improper Footwear Model")
 
-        self.lblMotorcycle = QtWidgets.QLabel("(not set)")
-        self.lblRider = QtWidgets.QLabel("(not set)")
-        self.lblHelmet = QtWidgets.QLabel("(not set)")
-        self.lblFootwear = QtWidgets.QLabel("(not set)")
-        self.lblImproperFootwear = QtWidgets.QLabel("(not set)")
+        self.lblMotorcycle = DropLabel("(not set)", allowed_exts=(".pt",))
+        self.lblRider = DropLabel("(not set)", allowed_exts=(".pt",))
+        self.lblHelmet = DropLabel("(not set)", allowed_exts=(".pt",))
+        self.lblFootwear = DropLabel("(not set)", allowed_exts=(".pt",))
+        self.lblImproperFootwear = DropLabel("(not set)", allowed_exts=(".pt",))
 
         self.btnPlay = QtWidgets.QPushButton("Play")
         self.btnPause = QtWidgets.QPushButton("Pause")
@@ -507,6 +649,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btnLoadFootwear.clicked.connect(lambda: self._pick_model_for_class(3))
         self.btnLoadImproperFootwear.clicked.connect(lambda: self._pick_model_for_class(4))
 
+        self.videoLabel.pathsDropped.connect(self._handle_dropped_paths)
+        self.lblMotorcycle.fileDropped.connect(lambda p: self._set_model_path_for_class(0, p))
+        self.lblRider.fileDropped.connect(lambda p: self._set_model_path_for_class(1, p))
+        self.lblHelmet.fileDropped.connect(lambda p: self._set_model_path_for_class(2, p))
+        self.lblFootwear.fileDropped.connect(lambda p: self._set_model_path_for_class(3, p))
+        self.lblImproperFootwear.fileDropped.connect(lambda p: self._set_model_path_for_class(4, p))
+
         self.btnPlay.clicked.connect(self._play)
         self.btnPause.clicked.connect(self._pause)
         self.btnStop.clicked.connect(self._stop)
@@ -524,6 +673,11 @@ class MainWindow(QtWidgets.QMainWindow):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
             self, "Select Video", "", "Video Files (*.mp4 *.avi *.mov);;All Files (*)"
         )
+        if not path:
+            return
+        self._set_video_path(path)
+
+    def _set_video_path(self, path: str) -> None:
         if not path:
             return
         self._video_path = path
@@ -563,9 +717,83 @@ class MainWindow(QtWidgets.QMainWindow):
         qimg = QtGui.QImage(rgb.data, w, h, ch * w, QtGui.QImage.Format_RGB888).copy()
         self._on_frame(qimg)
 
+    def _normalize_name(self, path: str) -> str:
+        base = os.path.basename(path)
+        base = os.path.splitext(base)[0]
+        base = base.lower()
+        for ch in ["-", "_", "."]:
+            base = base.replace(ch, " ")
+        return " ".join(base.split())
+
+    def _infer_class_id_from_filename(self, path: str) -> Optional[int]:
+        name = self._normalize_name(path)
+
+        # Order matters (e.g., 'improper_footwear' contains 'footwear')
+        patterns = [
+            (4, ["improper footwear", "improper", "no footwear", "nofootwear", "no shoe", "noshoe", "barefoot"]),
+            (3, ["footwear", "shoe", "shoes", "boot", "boots", "safety shoe", "safetyshoe"]),
+            (2, ["helmet", "hardhat"]),
+            (0, ["motorcycle", "motor bike", "motorbike", "moto"]),
+            (1, ["rider", "riding", "driver", "person"]),
+        ]
+
+        for class_id, keys in patterns:
+            for k in keys:
+                if k in name:
+                    return class_id
+        return None
+
+    def _handle_dropped_paths(self, paths: list) -> None:
+        if not paths:
+            return
+
+        unknown: List[str] = []
+        handled_any = False
+
+        for path in paths:
+            if not isinstance(path, str) or not path:
+                continue
+            ext = os.path.splitext(path)[1].lower()
+
+            if ext in {".mp4", ".avi", ".mov", ".mkv", ".wmv", ".flv"}:
+                self._set_video_path(path)
+                handled_any = True
+                continue
+
+            if ext == ".pt":
+                class_id = self._infer_class_id_from_filename(path)
+                if class_id is None:
+                    unknown.append(os.path.basename(path))
+                    continue
+                self._set_model_path_for_class(class_id, path)
+                handled_any = True
+                continue
+
+            unknown.append(os.path.basename(path))
+
+        if unknown and handled_any:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Some files were not recognized",
+                "These dropped files could not be auto-assigned:\n\n" + "\n".join(unknown) +
+                "\n\nTip: include keywords like rider, motorcycle, helmet, footwear, improper in the filename.",
+            )
+        elif unknown and not handled_any:
+            QtWidgets.QMessageBox.information(
+                self,
+                "No supported files",
+                "Drop a video (mp4/avi/mov/mkv/wmv/flv) and/or model weights (.pt) here.",
+            )
+
     def _pick_model_for_class(self, class_id: int) -> None:
         title = f"Select {CLASS_NAMES_DEFAULT.get(class_id, str(class_id))} Model"
         path, _ = QtWidgets.QFileDialog.getOpenFileName(self, title, "", "PyTorch Model (*.pt);;All Files (*)")
+        if not path:
+            return
+
+        self._set_model_path_for_class(class_id, path)
+
+    def _set_model_path_for_class(self, class_id: int, path: str) -> None:
         if not path:
             return
 
