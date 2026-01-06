@@ -276,7 +276,12 @@ class VideoThread(QtCore.QThread):
                     model = self._models.get(class_id)
                     if model is None:
                         continue
-                    pred_results = model.predict(frame, conf=self._config.conf, iou=self._config.iou, verbose=False)
+                    pred_results = model.predict(
+                        frame,
+                        conf=self._config.conf,
+                        iou=self._config.iou,
+                        verbose=False,
+                    )
                     pred0 = pred_results[0] if isinstance(pred_results, (list, tuple)) else pred_results
                     dets.extend(self._collect_dets(pred0, class_id_override=class_id, include_track_ids=False))
 
@@ -432,6 +437,39 @@ class MainWindow(QtWidgets.QMainWindow):
         self._video_path = path
         self._thread.set_video_path(path)
         self._set_status(f"Video selected: {os.path.basename(path)}")
+
+        # Quick sanity preview to confirm OpenCV can open/decode this file.
+        cap = cv2.VideoCapture(path)
+        if not cap.isOpened():
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Video Open Failed",
+                "OpenCV could not open the selected video.\n\n"
+                "Common causes:\n"
+                "- Unsupported codec (e.g., some H.265/HEVC MP4s)\n"
+                "- File path permissions\n\n"
+                f"Path:\n{path}",
+            )
+            self._set_status("Failed to open selected video")
+            return
+
+        ok, frame = cap.read()
+        cap.release()
+        if not ok or frame is None:
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Video Decode Failed",
+                "OpenCV opened the file but could not decode the first frame.\n\n"
+                "Try re-encoding the video to H.264 (AVC) or using a different file.",
+            )
+            self._set_status("Failed to decode video")
+            return
+
+        # Display preview frame
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w, ch = rgb.shape
+        qimg = QtGui.QImage(rgb.data, w, h, ch * w, QtGui.QImage.Format_RGB888).copy()
+        self._on_frame(qimg)
 
     def _pick_model_for_class(self, class_id: int) -> None:
         title = f"Select {CLASS_NAMES_DEFAULT.get(class_id, str(class_id))} Model"
