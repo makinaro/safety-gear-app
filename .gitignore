@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.so
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+
+# Data / artifacts (adjust if you want to version these)
+*.mp4
+*.avi
+*.mov
+
+# Model weights (remove this if you want to commit .pt files)
+*.pt
+
+# Ultralytics outputs
+runs/

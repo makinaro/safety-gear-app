@@ -1,0 +1,20 @@
+# Ultralytics tracker config - BoT-SORT
+# Goal: keep camera motion compensation (global motion compensation) active.
+# Note: Ultralytics uses GMC (Global Motion Compensation) for camera motion.
+
+tracker_type: botsort
+
+track_high_thresh: 0.5
+track_low_thresh: 0.1
+new_track_thresh: 0.6
+track_buffer: 30
+match_thresh: 0.8
+
+fuse_score: true
+
+# Camera Motion Compensation / Global Motion Compensation
+# Common options in Ultralytics: sparseOptFlow, orb, ecc, none
+gmc_method: sparseOptFlow
+
+# ReID is typically disabled in Ultralytics' BoT-SORT implementation
+with_reid: false
