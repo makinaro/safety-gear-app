@@ -36,6 +36,35 @@ CLASS_NAMES_DEFAULT: Dict[int, str] = {
 
 TARGET_CLASS_IDS: Tuple[int, ...] = (0, 1, 2, 3, 4)
 
+# Post-processing overlap thresholds to reduce false positives.
+# We use intersection-over-area (IoA) instead of IoU because Helmet/Footwear boxes
+# are much smaller than Rider boxes and IoU can be tiny even when correct.
+RIDER_REQUIRES_MOTORCYCLE_IOA: float = 0.05
+GEAR_REQUIRES_RIDER_IOA: float = 0.20
+
+
+def _box_area(box: Tuple[int, int, int, int]) -> int:
+    x1, y1, x2, y2 = box
+    return max(0, x2 - x1) * max(0, y2 - y1)
+
+
+def _intersection_area(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> int:
+    ax1, ay1, ax2, ay2 = a
+    bx1, by1, bx2, by2 = b
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    return max(0, ix2 - ix1) * max(0, iy2 - iy1)
+
+
+def _ioa(child: Tuple[int, int, int, int], parent: Tuple[int, int, int, int]) -> float:
+    area_child = _box_area(child)
+    if area_child <= 0:
+        return 0.0
+    inter = _intersection_area(child, parent)
+    return inter / float(area_child)
+
 
 def clamp01(value: float) -> float:
     return max(0.0, min(1.0, float(value)))
@@ -196,6 +225,47 @@ class VideoThread(QtCore.QThread):
 
         return annotated
 
+    def _filter_dets_by_overlap(self, dets):
+        """Reduce false positives by enforcing expected spatial relationships.
+
+        Rules:
+        - Rider (1) must overlap a Motorcycle (0)
+        - Helmet (2), Footwear (3), Improper_Footwear (4) must overlap a Rider (1)
+        """
+        motorcycles = [d for d in dets if d[4] == 0]
+        riders = [d for d in dets if d[4] == 1]
+        gear = [d for d in dets if d[4] in (2, 3, 4)]
+
+        other = [d for d in dets if d[4] not in (0, 1, 2, 3, 4)]
+
+        moto_boxes = [(d[0], d[1], d[2], d[3]) for d in motorcycles]
+
+        # Filter riders by overlap with motorcycles
+        kept_riders = []
+        rider_boxes = []
+        if moto_boxes:
+            for d in riders:
+                rbox = (d[0], d[1], d[2], d[3])
+                ok = any(_ioa(rbox, mbox) >= RIDER_REQUIRES_MOTORCYCLE_IOA for mbox in moto_boxes)
+                if ok:
+                    kept_riders.append(d)
+                    rider_boxes.append(rbox)
+        else:
+            # If there are no motorcycles detected, keep zero riders to avoid pedestrian false positives.
+            kept_riders = []
+            rider_boxes = []
+
+        # Filter gear by overlap with kept riders
+        kept_gear = []
+        if rider_boxes:
+            for d in gear:
+                gbox = (d[0], d[1], d[2], d[3])
+                ok = any(_ioa(gbox, rbox) >= GEAR_REQUIRES_RIDER_IOA for rbox in rider_boxes)
+                if ok:
+                    kept_gear.append(d)
+
+        return motorcycles + kept_riders + kept_gear + other
+
     def run(self) -> None:
         self._stop = False
         self._paused = True
@@ -285,6 +355,7 @@ class VideoThread(QtCore.QThread):
                     pred0 = pred_results[0] if isinstance(pred_results, (list, tuple)) else pred_results
                     dets.extend(self._collect_dets(pred0, class_id_override=class_id, include_track_ids=False))
 
+                dets = self._filter_dets_by_overlap(dets)
                 annotated = self._annotate(frame, dets)
             except Exception as e:
                 self._emit_status(f"Inference error: {e}")
