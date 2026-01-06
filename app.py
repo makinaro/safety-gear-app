@@ -190,6 +190,7 @@ class VideoThread(QtCore.QThread):
         self._video_path: Optional[str] = None
         self._model_paths: Dict[int, Optional[str]] = {cid: None for cid in TARGET_CLASS_IDS}
         self._config = AppConfig()
+        self._class_colors_bgr: Dict[int, Tuple[int, int, int]] = dict(CLASS_COLORS_BGR)
         self._stop = False
         self._paused = True
         self._restart_requested = False
@@ -221,6 +222,12 @@ class VideoThread(QtCore.QThread):
 
     def set_gear_rider_ioa(self, value: float) -> None:
         self._config.gear_rider_ioa = max(0.0, min(1.0, float(value)))
+
+    def set_class_color_bgr(self, class_id: int, bgr: Tuple[int, int, int]) -> None:
+        if class_id not in TARGET_CLASS_IDS:
+            return
+        b, g, r = [int(v) for v in bgr]
+        self._class_colors_bgr[class_id] = (max(0, min(255, b)), max(0, min(255, g)), max(0, min(255, r)))
 
     def play(self) -> None:
         self._paused = False
@@ -302,7 +309,7 @@ class VideoThread(QtCore.QThread):
         annotated = frame_bgr.copy()
 
         for (x1, y1, x2, y2, class_id, score, track_id) in dets:
-            color = CLASS_COLORS_BGR.get(class_id, (0, 255, 255))
+            color = self._class_colors_bgr.get(class_id, (0, 255, 255))
 
             label = CLASS_NAMES_DEFAULT.get(class_id, str(class_id))
             label += f" {score:.2f}"
@@ -499,12 +506,57 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self._video_path: Optional[str] = None
         self._model_paths: Dict[int, Optional[str]] = {cid: None for cid in TARGET_CLASS_IDS}
+        self._settings = QtCore.QSettings("safety-gear-app", "sgct")
+        self._class_colors_bgr: Dict[int, Tuple[int, int, int]] = dict(CLASS_COLORS_BGR)
+        self._load_saved_colors()
 
         self._thread = VideoThread()
         self._thread.frameReady.connect(self._on_frame)
         self._thread.statusReady.connect(self._set_status)
 
+        for cid, bgr in self._class_colors_bgr.items():
+            self._thread.set_class_color_bgr(cid, bgr)
+
         self._build_ui()
+
+    def _load_saved_colors(self) -> None:
+        for cid in TARGET_CLASS_IDS:
+            key = f"colors/{cid}"
+            val = self._settings.value(key, None)
+            if not val:
+                continue
+            try:
+                if isinstance(val, str):
+                    parts = [int(x.strip()) for x in val.split(",")]
+                else:
+                    parts = [int(x) for x in val]
+                if len(parts) == 3:
+                    b, g, r = parts
+                    self._class_colors_bgr[cid] = (b, g, r)
+            except Exception:
+                continue
+
+    def _save_color(self, class_id: int, bgr: Tuple[int, int, int]) -> None:
+        b, g, r = [int(v) for v in bgr]
+        self._settings.setValue(f"colors/{class_id}", f"{b},{g},{r}")
+
+    def _apply_color_border(self, widget: QtWidgets.QWidget, bgr: Tuple[int, int, int]) -> None:
+        b, g, r = [int(v) for v in bgr]
+        widget.setStyleSheet(f"border: 2px solid rgb({r}, {g}, {b}); padding: 2px;")
+
+    def _pick_color_for_class(self, class_id: int, label_widget: QtWidgets.QWidget) -> None:
+        b, g, r = self._class_colors_bgr.get(class_id, (0, 255, 255))
+        initial = QtGui.QColor(r, g, b)
+        color = QtWidgets.QColorDialog.getColor(initial, self, f"Select {CLASS_NAMES_DEFAULT.get(class_id, str(class_id))} Color")
+        if not color.isValid():
+            return
+
+        new_bgr = (int(color.blue()), int(color.green()), int(color.red()))
+        self._class_colors_bgr[class_id] = new_bgr
+        self._save_color(class_id, new_bgr)
+        self._thread.set_class_color_bgr(class_id, new_bgr)
+        self._apply_color_border(label_widget, new_bgr)
+        self._set_status(f"Color updated for {CLASS_NAMES_DEFAULT.get(class_id, str(class_id))}")
 
     def dragEnterEvent(self, event: QtGui.QDragEnterEvent) -> None:
         md = event.mimeData()
@@ -565,6 +617,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.lblFootwear = DropLabel("(not set)", allowed_exts=(".pt",))
         self.lblImproperFootwear = DropLabel("(not set)", allowed_exts=(".pt",))
 
+        # Show current bbox colors (border) and allow right-click to change.
+        for cid, lbl in [
+            (0, self.lblMotorcycle),
+            (1, self.lblRider),
+            (2, self.lblHelmet),
+            (3, self.lblFootwear),
+            (4, self.lblImproperFootwear),
+        ]:
+            self._apply_color_border(lbl, self._class_colors_bgr.get(cid, CLASS_COLORS_BGR[cid]))
+            lbl.setToolTip("Right-click to change bounding box color")
+            lbl.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
+            lbl.customContextMenuRequested.connect(lambda _pos, c=cid, w=lbl: self._pick_color_for_class(c, w))
+
         self.btnPlay = QtWidgets.QPushButton("Play")
         self.btnPause = QtWidgets.QPushButton("Pause")
         self.btnStop = QtWidgets.QPushButton("Stop")
@@ -611,7 +676,7 @@ class MainWindow(QtWidgets.QMainWindow):
         grid.addWidget(self.lblFootwear, 2, 3)
 
         grid.addWidget(self.btnLoadImproperFootwear, 3, 0)
-        grid.addWidget(self.lblImproperFootwear, 3, 1, 1, 3)
+        grid.addWidget(self.lblImproperFootwear, 3, 1)
 
         grid.addWidget(QtWidgets.QLabel("Conf Threshold"), 4, 0)
         grid.addWidget(self.confSlider, 4, 1, 1, 2)
