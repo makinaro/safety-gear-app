@@ -2,12 +2,12 @@ import os
 import sys
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PyQt5 import QtCore, QtGui, QtWidgets
 from ultralytics import YOLO
+from PyQt5 import QtCore, QtGui, QtWidgets
 
 
 @dataclass
@@ -32,6 +32,9 @@ CLASS_NAMES_DEFAULT: Dict[int, str] = {
     3: "Footwear",
     4: "Improper_Footwear",
 }
+
+
+TARGET_CLASS_IDS: Tuple[int, ...] = (0, 1, 2, 3, 4)
 
 
 def clamp01(value: float) -> float:
@@ -59,20 +62,23 @@ class VideoThread(QtCore.QThread):
     def __init__(self) -> None:
         super().__init__()
         self._video_path: Optional[str] = None
-        self._model_path: Optional[str] = None
+        self._model_paths: Dict[int, Optional[str]] = {cid: None for cid in TARGET_CLASS_IDS}
         self._config = AppConfig()
         self._stop = False
         self._paused = True
         self._restart_requested = False
-        self._model: Optional[YOLO] = None
+        self._models: Dict[int, YOLO] = {}
 
         self._frame_delay_ms: int = 1
 
     def set_video_path(self, path: Optional[str]) -> None:
         self._video_path = path
 
-    def set_model_path(self, path: Optional[str]) -> None:
-        self._model_path = path
+    def set_model_path_for_class(self, class_id: int, path: Optional[str]) -> None:
+        if class_id not in self._model_paths:
+            return
+        self._model_paths[class_id] = path
+        self._restart_requested = True
 
     def set_conf(self, conf: float) -> None:
         self._config.conf = clamp01(conf)
@@ -98,60 +104,79 @@ class VideoThread(QtCore.QThread):
         self.statusReady.emit(text)
 
     def _load_model(self) -> None:
-        if not self._model_path:
-            raise RuntimeError("No model selected")
-        self._emit_status(f"Loading model: {os.path.basename(self._model_path)}")
-        self._model = YOLO(self._model_path)
+        rider_path = self._model_paths.get(1)
+        if not rider_path:
+            raise RuntimeError("No Rider model selected (class 1)")
 
-    def _annotate(self, frame_bgr: np.ndarray, result) -> np.ndarray:
-        annotated = frame_bgr.copy()
+        # Load selected models; Rider (class 1) is required for tracking.
+        self._models.clear()
+        for class_id, path in self._model_paths.items():
+            if not path:
+                continue
+            self._emit_status(
+                f"Loading model for {CLASS_NAMES_DEFAULT.get(class_id, str(class_id))}: {os.path.basename(path)}"
+            )
+            self._models[class_id] = YOLO(path)
 
-        names = getattr(result, "names", None) or {}
+        if 1 not in self._models:
+            # Should not happen, but keep the error explicit.
+            raise RuntimeError("Failed to load Rider model")
 
+    def _collect_dets(
+        self,
+        result,
+        class_id_override: int,
+        include_track_ids: bool,
+    ) -> List[Tuple[int, int, int, int, int, float, Optional[int]]]:
         boxes = getattr(result, "boxes", None)
         if boxes is None:
-            return annotated
+            return []
 
         xyxy = getattr(boxes, "xyxy", None)
-        cls = getattr(boxes, "cls", None)
         conf = getattr(boxes, "conf", None)
         ids = getattr(boxes, "id", None)
 
-        if xyxy is None or cls is None:
-            return annotated
+        if xyxy is None:
+            return []
 
         xyxy = xyxy.cpu().numpy() if hasattr(xyxy, "cpu") else np.asarray(xyxy)
-        cls = cls.cpu().numpy() if hasattr(cls, "cpu") else np.asarray(cls)
 
         conf_arr = None
         if conf is not None:
             conf_arr = conf.cpu().numpy() if hasattr(conf, "cpu") else np.asarray(conf)
 
         id_arr = None
-        if ids is not None:
+        if include_track_ids and ids is not None:
             try:
                 id_arr = ids.cpu().numpy() if hasattr(ids, "cpu") else np.asarray(ids)
             except Exception:
                 id_arr = None
 
+        dets: List[Tuple[int, int, int, int, int, float, Optional[int]]] = []
         for i in range(len(xyxy)):
             x1, y1, x2, y2 = [int(v) for v in xyxy[i]]
-            class_id = int(cls[i])
-
-            color = CLASS_COLORS_BGR.get(class_id, (0, 255, 255))
-
-            label_name = names.get(class_id, CLASS_NAMES_DEFAULT.get(class_id, str(class_id)))
-            label = label_name
-
-            if conf_arr is not None:
-                label += f" {conf_arr[i]:.2f}"
-
-            if class_id == 1 and id_arr is not None and i < len(id_arr) and id_arr[i] is not None:
+            score = float(conf_arr[i]) if conf_arr is not None else 0.0
+            track_id: Optional[int] = None
+            if id_arr is not None and i < len(id_arr) and id_arr[i] is not None:
                 try:
                     track_id = int(id_arr[i])
-                    label += f" ID:{track_id}"
                 except Exception:
-                    pass
+                    track_id = None
+            dets.append((x1, y1, x2, y2, int(class_id_override), score, track_id))
+
+        return dets
+
+    def _annotate(self, frame_bgr: np.ndarray, dets) -> np.ndarray:
+        annotated = frame_bgr.copy()
+
+        for (x1, y1, x2, y2, class_id, score, track_id) in dets:
+            color = CLASS_COLORS_BGR.get(class_id, (0, 255, 255))
+
+            label = CLASS_NAMES_DEFAULT.get(class_id, str(class_id))
+            label += f" {score:.2f}"
+
+            if class_id == 1 and track_id is not None:
+                label += f" ID:{track_id}"
 
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
 
@@ -210,7 +235,14 @@ class VideoThread(QtCore.QThread):
             if self._restart_requested:
                 self._restart_requested = False
                 cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                self._emit_status("Restarted video due to tracker change")
+                # Reload models so model-path changes take effect.
+                try:
+                    self._load_model()
+                except Exception as e:
+                    self._emit_status(f"Model load error: {e}")
+                    self._paused = True
+                    continue
+                self._emit_status("Restarted video due to configuration change")
 
             ok, frame = cap.read()
             if not ok:
@@ -223,7 +255,9 @@ class VideoThread(QtCore.QThread):
                 tracker_path = tracker_yaml_path("bytetrack")
 
             try:
-                results = self._model.track(
+                # 1) Rider model drives tracking.
+                rider_model = self._models[1]
+                track_results = rider_model.track(
                     frame,
                     conf=self._config.conf,
                     iou=self._config.iou,
@@ -232,8 +266,21 @@ class VideoThread(QtCore.QThread):
                     verbose=False,
                 )
 
-                result0 = results[0] if isinstance(results, (list, tuple)) else results
-                annotated = self._annotate(frame, result0)
+                track_result0 = track_results[0] if isinstance(track_results, (list, tuple)) else track_results
+                dets = self._collect_dets(track_result0, class_id_override=1, include_track_ids=True)
+
+                # 2) Other single-class models run detection (no tracking IDs).
+                for class_id in TARGET_CLASS_IDS:
+                    if class_id == 1:
+                        continue
+                    model = self._models.get(class_id)
+                    if model is None:
+                        continue
+                    pred_results = model.predict(frame, conf=self._config.conf, iou=self._config.iou, verbose=False)
+                    pred0 = pred_results[0] if isinstance(pred_results, (list, tuple)) else pred_results
+                    dets.extend(self._collect_dets(pred0, class_id_override=class_id, include_track_ids=False))
+
+                annotated = self._annotate(frame, dets)
             except Exception as e:
                 self._emit_status(f"Inference error: {e}")
                 self._paused = True
@@ -268,7 +315,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("Safety Gear Compliance Tester (YOLO + Tracking)")
 
         self._video_path: Optional[str] = None
-        self._model_path: Optional[str] = None
+        self._model_paths: Dict[int, Optional[str]] = {cid: None for cid in TARGET_CLASS_IDS}
 
         self._thread = VideoThread()
         self._thread.frameReady.connect(self._on_frame)
@@ -286,7 +333,18 @@ class MainWindow(QtWidgets.QMainWindow):
         self.videoLabel.setStyleSheet("background-color: #111; color: #ddd;")
 
         self.btnLoadVideo = QtWidgets.QPushButton("Load Video (.mp4)")
-        self.btnLoadModel = QtWidgets.QPushButton("Load Model (.pt)")
+
+        self.btnLoadMotorcycle = QtWidgets.QPushButton("Load Motorcycle Model")
+        self.btnLoadRider = QtWidgets.QPushButton("Load Rider Model (required)")
+        self.btnLoadHelmet = QtWidgets.QPushButton("Load Helmet Model")
+        self.btnLoadFootwear = QtWidgets.QPushButton("Load Footwear Model")
+        self.btnLoadImproperFootwear = QtWidgets.QPushButton("Load Improper Footwear Model")
+
+        self.lblMotorcycle = QtWidgets.QLabel("(not set)")
+        self.lblRider = QtWidgets.QLabel("(not set)")
+        self.lblHelmet = QtWidgets.QLabel("(not set)")
+        self.lblFootwear = QtWidgets.QLabel("(not set)")
+        self.lblImproperFootwear = QtWidgets.QLabel("(not set)")
 
         self.btnPlay = QtWidgets.QPushButton("Play")
         self.btnPause = QtWidgets.QPushButton("Pause")
@@ -309,18 +367,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self.iouValue = QtWidgets.QLabel("0.45")
 
         grid = QtWidgets.QGridLayout()
-        grid.addWidget(self.btnLoadVideo, 0, 0)
-        grid.addWidget(self.btnLoadModel, 0, 1)
+        grid.addWidget(self.btnLoadVideo, 0, 0, 1, 2)
         grid.addWidget(QtWidgets.QLabel("Tracker"), 0, 2)
         grid.addWidget(self.trackerCombo, 0, 3)
 
-        grid.addWidget(QtWidgets.QLabel("Conf Threshold"), 1, 0)
-        grid.addWidget(self.confSlider, 1, 1, 1, 2)
-        grid.addWidget(self.confValue, 1, 3)
+        grid.addWidget(self.btnLoadMotorcycle, 1, 0)
+        grid.addWidget(self.lblMotorcycle, 1, 1)
+        grid.addWidget(self.btnLoadRider, 1, 2)
+        grid.addWidget(self.lblRider, 1, 3)
 
-        grid.addWidget(QtWidgets.QLabel("IoU Threshold"), 2, 0)
-        grid.addWidget(self.iouSlider, 2, 1, 1, 2)
-        grid.addWidget(self.iouValue, 2, 3)
+        grid.addWidget(self.btnLoadHelmet, 2, 0)
+        grid.addWidget(self.lblHelmet, 2, 1)
+        grid.addWidget(self.btnLoadFootwear, 2, 2)
+        grid.addWidget(self.lblFootwear, 2, 3)
+
+        grid.addWidget(self.btnLoadImproperFootwear, 3, 0)
+        grid.addWidget(self.lblImproperFootwear, 3, 1, 1, 3)
+
+        grid.addWidget(QtWidgets.QLabel("Conf Threshold"), 4, 0)
+        grid.addWidget(self.confSlider, 4, 1, 1, 2)
+        grid.addWidget(self.confValue, 4, 3)
+
+        grid.addWidget(QtWidgets.QLabel("IoU Threshold"), 5, 0)
+        grid.addWidget(self.iouSlider, 5, 1, 1, 2)
+        grid.addWidget(self.iouValue, 5, 3)
 
         btnRow = QtWidgets.QHBoxLayout()
         btnRow.addWidget(self.btnPlay)
@@ -336,7 +406,11 @@ class MainWindow(QtWidgets.QMainWindow):
         layout.addWidget(self.statusBar)
 
         self.btnLoadVideo.clicked.connect(self._pick_video)
-        self.btnLoadModel.clicked.connect(self._pick_model)
+        self.btnLoadMotorcycle.clicked.connect(lambda: self._pick_model_for_class(0))
+        self.btnLoadRider.clicked.connect(lambda: self._pick_model_for_class(1))
+        self.btnLoadHelmet.clicked.connect(lambda: self._pick_model_for_class(2))
+        self.btnLoadFootwear.clicked.connect(lambda: self._pick_model_for_class(3))
+        self.btnLoadImproperFootwear.clicked.connect(lambda: self._pick_model_for_class(4))
 
         self.btnPlay.clicked.connect(self._play)
         self.btnPause.clicked.connect(self._pause)
@@ -359,15 +433,28 @@ class MainWindow(QtWidgets.QMainWindow):
         self._thread.set_video_path(path)
         self._set_status(f"Video selected: {os.path.basename(path)}")
 
-    def _pick_model(self) -> None:
-        path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select Model", "", "PyTorch Model (*.pt);;All Files (*)"
-        )
+    def _pick_model_for_class(self, class_id: int) -> None:
+        title = f"Select {CLASS_NAMES_DEFAULT.get(class_id, str(class_id))} Model"
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(self, title, "", "PyTorch Model (*.pt);;All Files (*)")
         if not path:
             return
-        self._model_path = path
-        self._thread.set_model_path(path)
-        self._set_status(f"Model selected: {os.path.basename(path)}")
+
+        self._model_paths[class_id] = path
+        self._thread.set_model_path_for_class(class_id, path)
+
+        base = os.path.basename(path)
+        if class_id == 0:
+            self.lblMotorcycle.setText(base)
+        elif class_id == 1:
+            self.lblRider.setText(base)
+        elif class_id == 2:
+            self.lblHelmet.setText(base)
+        elif class_id == 3:
+            self.lblFootwear.setText(base)
+        elif class_id == 4:
+            self.lblImproperFootwear.setText(base)
+
+        self._set_status(f"Model set for {CLASS_NAMES_DEFAULT.get(class_id, str(class_id))}: {base}")
 
     def _ensure_thread_started(self) -> None:
         if self._thread.isRunning():
@@ -375,8 +462,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self._thread.start()
 
     def _play(self) -> None:
-        if not self._video_path or not self._model_path:
-            self._set_status("Select a video and a model first")
+        if not self._video_path:
+            self._set_status("Select a video first")
+            return
+        if not self._model_paths.get(1):
+            self._set_status("Select the Rider model (required) to enable tracking")
             return
         self._ensure_thread_started()
         self._thread.play()
